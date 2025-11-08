@@ -4,7 +4,7 @@
 VENV = venv
 PYTHON = $(VENV)/bin/python
 PIP = $(VENV)/bin/pip
-SCRIPT = script.py
+SCRIPT = zonasul_scrapper.py
 REQUIREMENTS = requirements.txt
 
 # Cores para output
