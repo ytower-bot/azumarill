@@ -40,6 +40,8 @@ clean: ## Remove arquivos gerados e o ambiente virtual
 	@rm -rf $(VENV)
 	@rm -f produtos_hortifruti_zonasul.xlsx
 	@rm -f produtos_hortifruti_zonasul.csv
+	@rm -f produtos_hortifruti_prezunic.xlsx
+	@rm -f produtos_hortifruti_prezunic.csv
 	@rm -rf __pycache__
 	@rm -rf .pytest_cache
 	@rm -f *.pyc
@@ -49,6 +51,8 @@ clean-data: ## Remove apenas os arquivos de dados gerados (mantém venv)
 	@echo "$(GREEN)Removendo arquivos de dados...$(NC)"
 	@rm -f produtos_hortifruti_zonasul.xlsx
 	@rm -f produtos_hortifruti_zonasul.csv
+	@rm -f produtos_hortifruti_prezunic.xlsx
+	@rm -f produtos_hortifruti_prezunic.csv
 	@echo "$(GREEN)Arquivos de dados removidos!$(NC)"
 
 test: ## Testa se as dependências estão instaladas

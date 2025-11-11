@@ -8,7 +8,12 @@ from urllib.parse import quote
 
 # Configurações básicas
 HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
+    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+    'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'Connection': 'keep-alive',
+    'Upgrade-Insecure-Requests': '1',
 }
 
 def determinar_se_organico(nome_produto):
@@ -117,6 +122,101 @@ def extrair_produtos_jsonld(soup):
     
     return produtos
 
+def extrair_produtos_html(soup):
+    """
+    Extrai produtos diretamente do HTML.
+    Procura por elementos comuns de produtos em sites de e-commerce.
+    """
+    produtos = []
+    
+    # Prezunic usa VTEX, então vamos procurar por classes comuns do VTEX
+    # Classes comuns: vtex-product-summary-2-x-container, vtex-product-summary-2-x-nameContainer, etc.
+    
+    # Procura por containers de produtos
+    containers_produto = soup.find_all(['div', 'article', 'section'], 
+                                      class_=lambda x: x and ('product' in str(x).lower() or 
+                                                             'summary' in str(x).lower() or
+                                                             'item' in str(x).lower()))
+    
+    if len(containers_produto) == 0:
+        # Tenta procurar por links de produtos
+        links_produto = soup.find_all('a', href=re.compile(r'/produto|/p/|/product'))
+        
+        for link in links_produto:
+            # Tenta encontrar o nome do produto próximo ao link
+            container = link.find_parent(['div', 'article', 'section'])
+            if container:
+                # Procura por nome do produto
+                nome_elem = container.find(['h2', 'h3', 'span', 'div'], 
+                                          class_=lambda x: x and ('name' in str(x).lower() or 
+                                                                 'title' in str(x).lower()))
+                if not nome_elem:
+                    nome_elem = link
+                
+                nome = nome_elem.get_text(strip=True) if nome_elem else link.get_text(strip=True)
+                
+                # Procura por preço
+                preco_elem = container.find(['span', 'div', 'p'], 
+                                           class_=lambda x: x and ('price' in str(x).lower() or 
+                                                                   'valor' in str(x).lower()))
+                preco = None
+                if preco_elem:
+                    preco_texto = preco_elem.get_text(strip=True)
+                    # Extrai número do preço
+                    match_preco = re.search(r'R\$\s*(\d+[.,]\d+)', preco_texto)
+                    if match_preco:
+                        preco = match_preco.group(1).replace(',', '.')
+                
+                if nome:
+                    produtos.append({
+                        'nome_bruto': nome,
+                        'preco_bruto': preco
+                    })
+    
+    # Se ainda não encontrou, tenta procurar por imagens de produtos (alt text geralmente tem o nome)
+    if len(produtos) == 0:
+        imagens_produto = soup.find_all('img', alt=True, 
+                                       class_=lambda x: x and ('product' in str(x).lower() or 
+                                                              'image' in str(x).lower()))
+        
+        for img in imagens_produto:
+            nome = img.get('alt', '').strip()
+            if nome and len(nome) > 5:  # Nome deve ter pelo menos alguns caracteres
+                # Tenta encontrar preço próximo
+                container = img.find_parent(['div', 'article', 'section'])
+                preco = None
+                if container:
+                    preco_elem = container.find(['span', 'div', 'p'], 
+                                               class_=lambda x: x and 'price' in str(x).lower())
+                    if preco_elem:
+                        preco_texto = preco_elem.get_text(strip=True)
+                        match_preco = re.search(r'R\$\s*(\d+[.,]\d+)', preco_texto)
+                        if match_preco:
+                            preco = match_preco.group(1).replace(',', '.')
+                
+                produtos.append({
+                    'nome_bruto': nome,
+                    'preco_bruto': preco
+                })
+    
+    return produtos
+
+def extrair_produtos(soup):
+    """
+    Tenta extrair produtos usando diferentes métodos.
+    Prioridade: JSON-LD > HTML
+    """
+    produtos = []
+    
+    # Primeiro tenta JSON-LD
+    produtos = extrair_produtos_jsonld(soup)
+    
+    # Se não encontrou, tenta HTML
+    if len(produtos) == 0:
+        produtos = extrair_produtos_html(soup)
+    
+    return produtos
+
 def classificar_tipo_produto(nome_produto):
     """
     Classifica o tipo do produto baseado no nome.
@@ -174,20 +274,23 @@ def classificar_tipo_produto(nome_produto):
         return 'mercearia'
     
     # Processados: padaria, confeitaria, bebidas, condimentos, congelados, etc.
-    # Se não se encaixou em nenhuma categoria acima, vai para processados
     return 'processados'
 
-def coletar_todas_paginas(url_base, max_paginas=50):
+def coletar_todas_paginas(url_base, max_paginas=100, produtos_unicos_globais=None):
     """
     Coleta produtos de todas as páginas disponíveis.
     Para quando não encontrar mais produtos ou der erro.
     Retorna lista de todos os produtos coletados.
     """
     todos_produtos = []
-    pagina = 1
-    formato_pagina = None
-    urls_visitadas = set()  # Para evitar loops infinitos
-    produtos_por_pagina = []  # Para detectar páginas repetidas
+    pagina = 1  # Prezunic começa na página 1
+    urls_visitadas = set()
+    
+    # Usa conjunto global de produtos únicos se fornecido, senão cria um novo
+    if produtos_unicos_globais is None:
+        produtos_unicos = set()
+    else:
+        produtos_unicos = produtos_unicos_globais
     
     print(f"\n{'='*60}")
     print(f"Iniciando coleta de todas as páginas")
@@ -197,75 +300,15 @@ def coletar_todas_paginas(url_base, max_paginas=50):
     
     while pagina <= max_paginas:
         # Monta URL da página
-        if pagina == 1:
-            url = url_base
+        # Prezunic usa formato: ?page=1, ?page=2, etc.
+        if '?' in url_base:
+            url = f"{url_base}&page={pagina}"
         else:
-            # Detecta formato de paginação na página 2
-            if pagina == 2 and formato_pagina is None:
-                # Tenta diferentes formatos de paginação
-                formatos_teste = []
-                if '?' in url_base:
-                    formatos_teste = [
-                        f"{url_base}&page={pagina}",
-                        f"{url_base}&_page={pagina}",
-                        f"{url_base}&from={((pagina-1)*50)}",
-                    ]
-                else:
-                    formatos_teste = [
-                        f"{url_base}?page={pagina}",
-                        f"{url_base}?_page={pagina}",
-                        f"{url_base}?from={((pagina-1)*50)}",
-                    ]
-                
-                # Testa cada formato
-                for url_teste in formatos_teste:
-                    soup_test, status_test = buscar_pagina(url_teste, mostrar_log=False)
-                    if soup_test and status_test == 200:
-                        produtos_test = extrair_produtos_jsonld(soup_test)
-                        if len(produtos_test) > 0:
-                            url = url_teste
-                            if '&page=' in url_teste or '?page=' in url_teste:
-                                formato_pagina = 'page'
-                            elif '&_page=' in url_teste or '?_page=' in url_teste:
-                                formato_pagina = '_page'
-                            elif '&from=' in url_teste or '?from=' in url_teste:
-                                formato_pagina = 'from'
-                            print(f"   ✅ Formato de paginação detectado: {formato_pagina}")
-                            break
-                
-                if formato_pagina is None:
-                    formato_pagina = 'page'
-                    if '?' in url_base:
-                        url = f"{url_base}&page={pagina}"
-                    else:
-                        url = f"{url_base}?page={pagina}"
-            else:
-                # Usa o formato detectado
-                if formato_pagina == 'page':
-                    if '?' in url_base:
-                        url = f"{url_base}&page={pagina}"
-                    else:
-                        url = f"{url_base}?page={pagina}"
-                elif formato_pagina == '_page':
-                    if '?' in url_base:
-                        url = f"{url_base}&_page={pagina}"
-                    else:
-                        url = f"{url_base}?_page={pagina}"
-                elif formato_pagina == 'from':
-                    offset = (pagina - 1) * 50
-                    if '?' in url_base:
-                        url = f"{url_base}&from={offset}"
-                    else:
-                        url = f"{url_base}?from={offset}"
-                else:
-                    if '?' in url_base:
-                        url = f"{url_base}&page={pagina}"
-                    else:
-                        url = f"{url_base}?page={pagina}"
+            url = f"{url_base}?page={pagina}"
         
         print(f"📄 Página {pagina}: {url}")
         
-        # Verifica se já visitou esta URL (proteção contra loop)
+        # Verifica se já visitou esta URL
         if url in urls_visitadas:
             print(f"⚠️  URL já visitada anteriormente. Parando para evitar loop infinito.")
             break
@@ -280,35 +323,33 @@ def coletar_todas_paginas(url_base, max_paginas=50):
             break
         
         # Extrai produtos da página
-        produtos_pagina = extrair_produtos_jsonld(soup)
+        produtos_pagina = extrair_produtos(soup)
         
         # Se não encontrou produtos, acabaram as páginas
         if len(produtos_pagina) == 0:
             print(f"✅ Fim das páginas (página {pagina} não tem produtos)")
             break
         
-        # Verifica se esta página tem os mesmos produtos da anterior (proteção contra loop)
-        if produtos_por_pagina and len(produtos_por_pagina) > 0:
-            # Pega os nomes dos produtos da página anterior
-            nomes_anterior = {p['nome_bruto'] for p in produtos_por_pagina[-1]}
-            nomes_atual = {p['nome_bruto'] for p in produtos_pagina}
-            
-            # Se os produtos são exatamente iguais, pode ser loop
-            if nomes_anterior == nomes_atual and len(nomes_anterior) > 0:
-                print(f"⚠️  Página {pagina} tem os mesmos produtos da página anterior. Parando para evitar loop.")
-                break
+        # Remove duplicatas baseado no nome
+        produtos_novos = []
+        for produto in produtos_pagina:
+            nome = produto.get('nome_bruto', '').strip().lower()
+            if nome and nome not in produtos_unicos:
+                produtos_unicos.add(nome)
+                produtos_novos.append(produto)
         
-        # Guarda produtos desta página para comparação
-        produtos_por_pagina.append(produtos_pagina.copy())
+        if len(produtos_novos) == 0:
+            print(f"⚠️  Todos os produtos da página {pagina} são duplicados. Parando.")
+            break
         
         # Adiciona tipo e metadados (NÃO marca categoria orgânico/não orgânico aqui)
-        for produto in produtos_pagina:
+        for produto in produtos_novos:
             produto['tipo'] = classificar_tipo_produto(produto['nome_bruto'])
             produto['url_origem'] = url
         
         # Adiciona produtos encontrados
-        todos_produtos.extend(produtos_pagina)
-        print(f"   ✅ {len(produtos_pagina)} produtos encontrados (Total: {len(todos_produtos)})\n")
+        todos_produtos.extend(produtos_novos)
+        print(f"   ✅ {len(produtos_novos)} produtos novos encontrados (Total nesta categoria: {len(todos_produtos)})\n")
         
         pagina += 1
         
@@ -319,118 +360,7 @@ def coletar_todas_paginas(url_base, max_paginas=50):
         print(f"⚠️  Limite máximo de {max_paginas} páginas atingido.")
     
     print(f"\n{'='*60}")
-    print(f"Coleta concluída: {len(todos_produtos)} produtos em {pagina-1} páginas")
-    print(f"{'='*60}\n")
-    
-    return todos_produtos
-
-def buscar_produtos_por_termo(termo_busca):
-    """
-    Busca produtos orgânicos por termo usando o formato correto:
-    https://www.zonasul.com.br/organico?_q={termo}&map=ft
-    Retorna lista de produtos encontrados.
-    """
-    # Codifica o termo de busca para URL
-    termo_encoded = quote(termo_busca, safe='')
-    
-    # URL de busca do Zona Sul no formato correto
-    url_busca = f'https://www.zonasul.com.br/organico?_q={termo_encoded}&map=ft'
-    
-    print(f"\n🔍 Buscando por termo: '{termo_busca}'")
-    print(f"   URL: {url_busca}")
-    
-    # Verifica se a URL existe e tem produtos
-    soup, status = buscar_pagina(url_busca, mostrar_log=False)
-    
-    if soup is not None and status == 200:
-        produtos_teste = extrair_produtos_jsonld(soup)
-        if len(produtos_teste) > 0:
-            print(f"   ✅ URL de busca acessível com produtos encontrados")
-            produtos = coletar_todas_paginas(url_busca)
-            print(f"   📊 {len(produtos)} produtos encontrados para '{termo_busca}'")
-            return produtos
-        else:
-            print(f"   ⚠️  URL acessível mas nenhum produto encontrado na primeira página")
-    else:
-        print(f"   ⚠️  Erro ao acessar URL de busca (status: {status})")
-    
-    return []
-
-def coletar_produtos_organicos():
-    """
-    Coleta produtos orgânicos fazendo busca global por termos.
-    Termos buscados: orgânico, organico, organic
-    Retorna lista de produtos orgânicos encontrados.
-    """
-    todos_produtos = []
-    
-    print("=" * 60)
-    print("COLETA DE PRODUTOS ORGÂNICOS")
-    print("ESTRATÉGIA: Busca Global por Termos")
-    print("=" * 60)
-    
-    termos_busca = ['orgânico', 'organico', 'organic']
-    
-    for termo in termos_busca:
-        produtos_busca = buscar_produtos_por_termo(termo)
-        todos_produtos.extend(produtos_busca)
-        
-        # Delay entre buscas
-        if termo != termos_busca[-1]:
-            time.sleep(2)
-    
-    print(f"\n{'='*60}")
-    print(f"TOTAL DE PRODUTOS ORGÂNICOS COLETADOS: {len(todos_produtos)}")
-    print(f"{'='*60}\n")
-    
-    return todos_produtos
-
-def coletar_produtos_nao_organicos():
-    """
-    Coleta produtos não orgânicos de categorias específicas de alimentos.
-    Acessa páginas de categorias alimentares do site.
-    Retorna lista de produtos não orgânicos encontrados.
-    """
-    todos_produtos = []
-    
-    print("=" * 60)
-    print("COLETA DE PRODUTOS NÃO ORGÂNICOS")
-    print("ESTRATÉGIA: Categorias de Alimentos")
-    print("=" * 60)
-    
-    # Categorias de alimentos no Zona Sul
-    categorias_alimentos = [
-        ('hortifruti', 'Hortifruti'),
-        ('mercearia', 'Mercearia'),
-        ('laticinios', 'Laticínios'),
-        ('carnes', 'Carnes'),
-        ('padaria', 'Padaria'),
-        ('bebidas', 'Bebidas'),
-        ('congelados', 'Congelados'),
-        ('frios', 'Frios'),
-    ]
-    
-    for categoria_slug, categoria_nome in categorias_alimentos:
-        # URL da categoria (sem /organicos)
-        url = f'https://www.zonasul.com.br/{categoria_slug}'
-        
-        print(f"\n🔍 Coletando de: {categoria_nome}")
-        print(f"   URL: {url}")
-        
-        produtos = coletar_todas_paginas(url)
-        
-        if len(produtos) > 0:
-            todos_produtos.extend(produtos)
-            print(f"   ✅ {len(produtos)} produtos encontrados em {categoria_nome}")
-        else:
-            print(f"   ⚠️  Nenhum produto encontrado em {categoria_nome}")
-        
-        # Delay entre categorias
-        if categoria_slug != categorias_alimentos[-1][0]:
-            time.sleep(2)
-    
-    print(f"\n{'='*60}")
-    print(f"TOTAL DE PRODUTOS NÃO ORGÂNICOS COLETADOS: {len(todos_produtos)}")
+    print(f"Coleta concluída: {len(todos_produtos)} produtos únicos em {pagina-1} páginas")
     print(f"{'='*60}\n")
     
     return todos_produtos
@@ -476,7 +406,7 @@ def processar_dados_para_planilha(produtos):
     
     return dados_planilha
 
-def salvar_planilha(produtos, nome_arquivo='produtos_hortifruti_zonasul.xlsx'):
+def salvar_planilha(produtos, nome_arquivo='produtos_hortifruti_prezunic.xlsx'):
     """
     Salva os produtos coletados em planilhas Excel e CSV.
     Colunas: Nome, Quantidade, Unidade, Preço, Categoria, Tipo Produto
@@ -551,9 +481,108 @@ def salvar_planilha(produtos, nome_arquivo='produtos_hortifruti_zonasul.xlsx'):
         print(f"   ✅ {nome_csv}")
     print("=" * 60)
 
+def coletar_produtos_organicos():
+    """
+    Coleta produtos orgânicos fazendo busca por termo.
+    Retorna lista de produtos orgânicos encontrados.
+    """
+    todos_produtos = []
+    produtos_unicos_globais = set()  # Para evitar duplicatas entre diferentes buscas
+    
+    print("=" * 60)
+    print("COLETA DE PRODUTOS ORGÂNICOS")
+    print("ESTRATÉGIA: Busca por Termo 'organico'")
+    print("=" * 60)
+    
+    url_busca = 'https://www.prezunic.com.br/organico?_q=organico&map=ft'
+    
+    print(f"\n🔍 Coletando produtos orgânicos")
+    print(f"   URL: {url_busca}")
+    
+    # Coleta produtos orgânicos de todas as páginas
+    produtos = coletar_todas_paginas(url_busca, max_paginas=100, 
+                                     produtos_unicos_globais=produtos_unicos_globais)
+    
+    todos_produtos.extend(produtos)
+    
+    print(f"\n{'='*60}")
+    print(f"TOTAL DE PRODUTOS ORGÂNICOS COLETADOS: {len(todos_produtos)}")
+    print(f"{'='*60}\n")
+    
+    return todos_produtos
+
+def coletar_produtos_nao_organicos():
+    """
+    Coleta produtos não orgânicos de categorias específicas de alimentos.
+    Acessa páginas de categorias alimentares do site.
+    Retorna lista de produtos não orgânicos encontrados.
+    """
+    todos_produtos = []
+    produtos_unicos_globais = set()  # Para evitar duplicatas entre categorias
+    
+    print("=" * 60)
+    print("COLETA DE PRODUTOS NÃO ORGÂNICOS")
+    print("ESTRATÉGIA: Categorias de Alimentos")
+    print("=" * 60)
+    
+    # Categorias de alimentos no Prezunic (baseado no menu HTML fornecido)
+    categorias_alimentos = [
+        ('mercearia', 'Mercearia', 'https://www.prezunic.com.br/mercearia'),
+        ('carnes-e-aves', 'Carnes e Aves', 'https://www.prezunic.com.br/carnes-e-aves'),
+        ('frios-e-laticinios', 'Frios e Laticínios', 'https://www.prezunic.com.br/frios-e-laticinios'),
+        ('hortifruti', 'Hortifruti', 'https://www.prezunic.com.br/hortifruti'),
+    ]
+    
+    for categoria_slug, categoria_nome, url in categorias_alimentos:
+        print(f"\n🔍 Coletando de: {categoria_nome}")
+        print(f"   URL: {url}")
+        
+        produtos = coletar_todas_paginas(url, max_paginas=100,
+                                         produtos_unicos_globais=produtos_unicos_globais)
+        
+        if len(produtos) > 0:
+            todos_produtos.extend(produtos)
+            print(f"   ✅ {len(produtos)} produtos encontrados em {categoria_nome}")
+        else:
+            print(f"   ⚠️  Nenhum produto encontrado em {categoria_nome}")
+        
+        # Delay entre categorias
+        if categoria_slug != categorias_alimentos[-1][0]:
+            time.sleep(2)
+    
+    print(f"\n{'='*60}")
+    print(f"TOTAL DE PRODUTOS NÃO ORGÂNICOS COLETADOS: {len(todos_produtos)}")
+    print(f"{'='*60}\n")
+    
+    return todos_produtos
+
 def main():
     """Função principal - executa coleta de produtos orgânicos e não orgânicos e salva planilha"""
     todos_produtos = []
+    
+    # Primeiro, testa se consegue extrair produtos
+    print("=" * 60)
+    print("TESTE INICIAL - VERIFICANDO EXTRAÇÃO")
+    print("=" * 60)
+    
+    url_teste = 'https://www.prezunic.com.br/organico?_q=organico&map=ft'
+    soup, status = buscar_pagina(url_teste)
+    
+    if soup is None or status != 200:
+        print("❌ Erro ao acessar a página. Verifique a URL e sua conexão.")
+        return []
+    
+    # Testa extração
+    produtos_teste = extrair_produtos(soup)
+    
+    if len(produtos_teste) == 0:
+        print("⚠️  Nenhum produto encontrado na primeira página.")
+        print("⚠️  O site pode estar usando JavaScript para carregar produtos dinamicamente.")
+        print("⚠️  Será necessário usar Selenium ou outra ferramenta de renderização JavaScript.")
+        return []
+    
+    print(f"✅ {len(produtos_teste)} produtos encontrados na primeira página!")
+    print("✅ O site usa JSON-LD ou HTML para produtos. Continuando coleta...\n")
     
     # Coleta produtos orgânicos
     produtos_organicos = coletar_produtos_organicos()
@@ -581,3 +610,4 @@ def main():
 
 if __name__ == "__main__":
     produtos = main()
+
